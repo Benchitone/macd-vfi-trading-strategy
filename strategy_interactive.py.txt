@@ -1,0 +1,234 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+plt.style.use('seaborn-v0_8-darkgrid')
+
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def calculate_indicators(df):
+    df = df.copy()
+    df['tp'] = (df['High'] + df['Low'] + df['Close']) / 3
+
+    # MACD(8, 21, 5)
+    df['ema8'] = ema(df['Close'], 8)
+    df['ema21'] = ema(df['Close'], 21)
+    df['macd'] = df['ema8'] - df['ema21']
+    df['signal'] = ema(df['macd'], 5)
+
+    # VFI(65) - Markos Katsanos formula
+    period, coef, vcoef, smooth = 65, 0.2, 2.5, 3
+    df['inter'] = np.log(df['tp'] / df['tp'].shift(1))
+    df['vinter'] = df['inter'].rolling(30).std()
+    df['cutoff'] = coef * df['vinter'] * df['Close']
+    df['vave'] = df['Volume'].rolling(period).mean().shift(1)
+    df['vmax'] = df['vave'] * vcoef
+    df['vc'] = np.minimum(df['Volume'], df['vmax'])
+    df['mf'] = df['tp'] - df['tp'].shift(1)
+    df['vcp'] = np.where(df['mf'] > df['cutoff'], df['vc'],
+                         np.where(df['mf'] < -df['cutoff'], -df['vc'], 0))
+    df['vfi1'] = df['vcp'].rolling(period).sum() / df['vave']
+    df['vfi'] = ema(df['vfi1'], smooth)
+
+    # ATR(14) - Wilder’s smoothing
+    tr = pd.concat([
+        df['High'] - df['Low'],
+        abs(df['High'] - df['Close'].shift(1)),
+        abs(df['Low'] - df['Close'].shift(1))
+    ], axis=1).max(axis=1)
+    df['atr'] = tr.ewm(alpha=1/14, adjust=False).mean()
+
+    # Signals
+    df['macd_cross_up'] = (df['macd'] > df['signal']) & (df['macd'].shift(1) <= df['signal'].shift(1))
+    df['macd_cross_down'] = (df['macd'] < df['signal']) & (df['macd'].shift(1) >= df['signal'].shift(1))
+    df['buy_signal'] = df['macd_cross_up'] & (df['vfi'] > 0)
+    df['sell_signal'] = df['macd_cross_down']
+    return df
+
+def run_backtest(df, atr_mult=1.5, rr=2.0, use_trailing=False, commission=0.001):
+    cash = 100_000.0
+    shares = 0.0
+    position = 0
+    equity = []
+    trades = []
+    entry_price = stop_price = tp_price = 0.0
+    entry_date = None
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        date = df.index[i]
+        price = row['Close']
+        high = row['High']
+        low = row['Low']
+        atr = row['atr']
+
+        # Exit logic
+        if position == 1:
+            if use_trailing and not np.isnan(atr):
+                new_stop = price - (atr_mult * atr)
+                if new_stop > stop_price:
+                    stop_price = new_stop
+
+            hit_stop = low <= stop_price
+            hit_tp = (not use_trailing) and (high >= tp_price)
+
+            if hit_stop:
+                exit_price = stop_price
+                reason = "Trailing Stop" if use_trailing else "ATR Stop"
+            elif hit_tp:
+                exit_price = tp_price
+                reason = "Take Profit"
+            elif row['sell_signal']:
+                exit_price = price
+                reason = "MACD Cross"
+            else:
+                equity.append(cash + shares * price)
+                continue
+
+            cash = shares * exit_price * (1 - commission)
+            pnl = (exit_price - entry_price) / entry_price * 100
+            trades.append({
+                'Entry': entry_date.date(),
+                'Exit': date.date(),
+                'Entry Price': round(entry_price, 2),
+                'Exit Price': round(exit_price, 2),
+                'PnL %': round(pnl, 2),
+                'Reason': reason
+            })
+            shares = 0.0
+            position = 0
+
+        # Entry logic
+        if position == 0 and row['buy_signal'] and not np.isnan(row['atr']) and row['atr'] > 0:
+            entry_price = price
+            risk = atr_mult * row['atr']
+            stop_price = entry_price - risk
+            tp_price = entry_price + rr * risk
+            shares = (cash * (1 - commission)) / entry_price
+            cash = 0.0
+            position = 1
+            entry_date = date
+
+        equity.append(cash + shares * price)
+
+    # Close open position at the end
+    if position == 1:
+        final_price = df['Close'].iloc[-1]
+        cash = shares * final_price * (1 - commission)
+        pnl = (final_price - entry_price) / entry_price * 100
+        trades.append({
+            'Entry': entry_date.date(),
+            'Exit': df.index[-1].date(),
+            'Entry Price': round(entry_price, 2),
+            'Exit Price': round(final_price, 2),
+            'PnL %': round(pnl, 2),
+            'Reason': 'End of Data'
+        })
+        equity[-1] = cash
+
+    equity = pd.Series(equity, index=df.index)
+    total_return = (equity.iloc[-1] / 100_000 - 1) * 100
+    buy_hold = (df['Close'].iloc[-1] / df['Close'].iloc[0] - 1) * 100
+
+    if not trades:
+        return None
+
+    pnls = [t['PnL %'] for t in trades]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    win_rate = len(wins) / len(trades) * 100
+    profit_factor = sum(wins) / abs(sum(losses)) if losses else 999
+    max_dd = ((equity - equity.cummax()) / equity.cummax()).min() * 100
+
+    return {
+        'equity': equity,
+        'return': round(total_return, 1),
+        'buy_hold': round(buy_hold, 1),
+        'profit_factor': round(profit_factor, 2),
+        'win_rate': round(win_rate, 1),
+        'max_dd': round(max_dd, 1),
+        'trades': len(trades),
+        'trade_list': pd.DataFrame(trades)
+    }
+
+# ==================== INTERACTIVE LOOP ====================
+print("=" * 60)
+print("MACD + VFI Strategy – Interactive Tester")
+print("=" * 60)
+print("Recommended: ATR = 1.5 | Risk:Reward = 2.0 | Trailing = No")
+print("=" * 60)
+
+while True:
+    ticker = input("\nEnter ticker (or type 'quit' to exit): ").strip().upper()
+    
+    if ticker in ['QUIT', 'Q', 'EXIT']:
+        print("\nFinished. Happy trading!")
+        break
+    
+    if not ticker:
+        continue
+
+    try:
+        atr_input = input("ATR multiplier [default 1.5]: ").strip()
+        atr_mult = float(atr_input) if atr_input else 1.5
+
+        rr_input = input("Risk:Reward [default 2.0]: ").strip()
+        rr = float(rr_input) if rr_input else 2.0
+
+        trailing_input = input("Use trailing stop? (y/n) [default n]: ").strip().lower()
+        use_trailing = trailing_input in ['y', 'yes']
+    except ValueError:
+        print("Invalid input – using default settings.")
+        atr_mult, rr, use_trailing = 1.5, 2.0, False
+
+    print(f"\nDownloading {ticker} data...")
+    try:
+        df = yf.download(ticker, start="2018-01-01", end="2026-08-01", 
+                         auto_adjust=True, progress=False)
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        if len(df) < 200:
+            print("Not enough historical data for this ticker.")
+            continue
+
+        df = calculate_indicators(df)
+        result = run_backtest(df, atr_mult=atr_mult, rr=rr, use_trailing=use_trailing)
+
+        if result is None:
+            print("No trades were generated with these settings.")
+            continue
+
+        # Display results
+        print("\n" + "-" * 55)
+        print(f"RESULTS for {ticker}")
+        print("-" * 55)
+        print(f"Total Return      : {result['return']}%")
+        print(f"Buy & Hold        : {result['buy_hold']}%")
+        print(f"Profit Factor     : {result['profit_factor']}")
+        print(f"Win Rate          : {result['win_rate']}%")
+        print(f"Max Drawdown      : {result['max_dd']}%")
+        print(f"Number of Trades  : {result['trades']}")
+        print("-" * 55)
+
+        print("\nLast 5 trades:")
+        print(result['trade_list'].tail().to_string(index=False))
+
+        # Equity curve
+        plt.figure(figsize=(12, 5))
+        norm = result['equity'] / result['equity'].iloc[0] * 100
+        plt.plot(norm.index, norm, label='Strategy', color='#1f77b4', linewidth=2)
+        plt.title(f"{ticker}  |  Return: {result['return']}%  |  PF: {result['profit_factor']}  |  MaxDD: {result['max_dd']}%",
+                  fontsize=13)
+        plt.ylabel("Growth of $100")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+    except Exception as e:
+        print(f"\nError occurred: {e}")
+        print("Please try another ticker.")
